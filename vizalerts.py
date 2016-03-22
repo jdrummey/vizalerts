@@ -105,8 +105,15 @@ SCHEDULE_STATE_FILENAME = u'vizalerts.state'
 
 # reserved strings for Advanced Alerts embedding
 IMAGE_PLACEHOLDER = u'VIZ_IMAGE()' # special string for embedding viz images in Advanced Alert body
+PDF_PLACEHOLDER = u'VIZ_PDF()'
+CSV_PLACEHOLDER = u'VIZ_CSV()'
+TWB_PLACEHOLDER = u'VIZ_TWB()'
 DEFAULT_FOOTER = u'VIZALERTS_FOOTER()' # special string for embedding the default footer in an Advanced Alert
 
+# reserved strings for Advanced Alerts file export arguments
+EXPORTFILENAME_ARGUMENT = u'filename'
+EXPORTFILEPATH_ARGUMENT = u'exportfilepath'
+ARGUMENT_DELIMITER = u'|'
 
 class UnicodeCsvReader(object):
     """Code from http://stackoverflow.com/questions/1846135/general-unicode-utf-8-support-for-csv-files-in-python-2-6"""
@@ -195,6 +202,7 @@ def process_views(views):
         sitename = unicode(view["site_name"]).replace('Default', '')
         viewurlsuffix = view['view_url_suffix']
         viewname = unicode(view['view_name'])
+        logger.debug(viewurlsuffix)
         timeout_s = view['timeout_s']
         subscribersysname = unicode(view['subscriber_sysname'].decode('utf-8'))
         subscriberemail = view['subscriber_email']
@@ -526,14 +534,20 @@ def process_csv(csvpath, view, sitename, viewname, subscriberemail, subscribersy
             # export the viz to a PNG file
             imagepath = tabhttp.export_view(configs, view, tabhttp.Format.PNG, logger)
 
+            inlineattachments = []
+            for tmppath in [csvpath, imagepath]
+                tmpattachment = dict()
+                tmpattachment['imagepath'] = tmppath
+                inlineattachments.append(tmpattachment)
+            
             # embed the viz image
-            attachments = [csvpath, imagepath]
+            inlineattachments = [csvpath, imagepath]
             logger.info(u'Sending simple alert email to user {}'.format(subscriberemail))
             body = u'<a href="{}"><img src="cid:{}"></a>'.format(vizurl, basename(imagepath)) +\
                    bodyfooter.format(subscriberemail, vizurl, viewname)
             subject = unicode(u'Alert triggered for {}'.format(viewname))
             send_email(configs["smtp.address.from"], subscriberemail, subject, body,
-                       None, None, attachments)
+                       None, None, inlineattachments)
             return
         except Exception as e:
             errormessage = u'Alert was triggered, but encountered a failure rendering data/image: {}'.format(e.message)
@@ -563,9 +577,9 @@ def process_csv(csvpath, view, sitename, viewname, subscriberemail, subscribersy
             has_email_from = False
             has_email_cc = False
             has_email_bcc = False
-            has_email_attachment = False
             has_email_header = False
             has_email_footer = False
+            has_email_attachment = False
 
             # create variables for optional email fields
             email_from = None
@@ -589,6 +603,8 @@ def process_csv(csvpath, view, sitename, viewname, subscriberemail, subscribersy
                 has_email_header = True
             if u' Email Footer ~' in csvreader.fieldnames:
                 has_email_footer = True
+            if u' Email Attachment ~' in csvreader.fieldnames:
+                has_email_attachment = True
 
             logger.debug(u'Validating email addresses')
             # validate all From and Recipient addresses
@@ -607,30 +623,39 @@ def process_csv(csvpath, view, sitename, viewname, subscriberemail, subscribersy
                 addresslist = addresslist + u'</table>'
                 view_failure(view, u'VizAlerts was unable to process this view due to the following error: ' + \
                                 u'Errors found in recipients:<br><br>{}'.format(addresslist) + \
-								u'<br><br>See row numbers in attached CSV file.' ,
+                                u'<br><br>See row numbers in attached CSV file.' ,
                                 [csvpath])
                 return
 
             # eliminate duplicate rows and ensure proper sorting
-            data = get_unique_vizdata(data, has_consolidate_email, has_email_from, has_email_cc, has_email_bcc, has_email_header, has_email_footer)
+            data = get_unique_vizdata(data, has_consolidate_email, has_email_from, has_email_cc, has_email_bcc, has_email_header, has_email_footer, has_email_attachment)
             rowcount_unique = len(data)
 
-            # determine whether we need to render the viz image--if so, render it to file
-            vizimagerefs = find_vizimages_in_body(data, has_email_header, has_email_footer)
-            if vizimagerefs:
-                try:
-                    # export the viz to a PNG file
-                    imagepath = tabhttp.export_view(configs, view, tabhttp.Format.PNG, logger)
-                except Exception as e:
-                    errormessage = u'Alert was triggered, but encountered a failure rendering data/image: {}'.format(e.message)
-                    logger.error(errormessage)
-                    view_failure(view, errormessage)
-                    raise e
+            # could be multiple viz's (including PDF, CSV, TWB) for a single row in the CSV
+            # return a list of all found VIZ_*() strings including any custom views w/ or w/out URL parameters as well
+            # as VizAlerts parameters. The structure is: 
+            # VIZ_*([optional custom view w/optional custom URL parameters]|[optional VizAlerts parameters])
+            #   - The custom view could be myWorkbook/myView?field1=value1
+            #   - The VizAlerts parameters are separated by | (pipe) characters since they are 
+            #       technically not allowed in URL parameters. The two VizAlerts parameters are:
+            #       - filename=[filename used for attachments and file export without extension]
+            #       - exportpathname=[pathname used for file export]
 
+            vizcompleterefs = dict()
+
+            try:
+                vizcompleterefs = find_viz_refs(data, viewurlsuffix, has_email_header, has_email_footer, has_email_attachment)
+            except Exception as e:
+                errormessage = u'Alert was triggered, but encountered a failure getting data/image references: {}'.format(e.message)
+                logger.error(errormessage)
+                view_failure(view, errormessage)
+                raise e
+            
             # iterate through the rows and send emails accordingly
             consolidate_email_ctr = 0
             body = []
-            attachments = []
+            inlineattachments = []
+            appendattachments =[]
 
             # Process each row of data
             for i, row in enumerate(data):
@@ -677,37 +702,20 @@ def process_csv(csvpath, view, sitename, viewname, subscriberemail, subscribersy
                                                                                         email_cc, email_bcc ,
                                                                                         row[' Email Subject *']))
                                 try: # remove this later??
-                                    body.append(row[' Email Body *'])
-
-                                    # if author used their own footer, add it now
-                                    if has_email_footer:
-                                        body.append(row[' Email Footer ~'].replace(DEFAULT_FOOTER,
-                                                                    bodyfooter.format(subscriberemail, vizurl, viewname)))  # only append the last value
-                                    else:
-                                        # no footer specified, add the default footer
-                                        body.append(bodyfooter.format(subscriberemail, vizurl, viewname))
-
-                                    # Add the viz image if needed
-                                    replaceresult = replace_in_list(body, IMAGE_PLACEHOLDER,
-                                                                        u'<img src="cid:{}">'.format(basename(imagepath))
-                                                            )
-
-                                    if replaceresult['foundstring'] == True:
-                                        body = replaceresult['outlist']
-                                        if imagepath not in attachments:
-                                            attachments.append(imagepath)
-
+                                    body, inlineattachments, appendattachments = append_body_and_attachments(body, inlineattachments, appendattachments, row, imagepaths, subscriberemail, vizurl, viewname, has_email_footer, has_email_attachment)
+                                    
                                     # send the email
                                     send_email(email_from, row[' Email To *'], row[' Email Subject *'],
-                                               u''.join(body), email_cc, email_bcc, attachments)
+                                               u''.join(body), email_cc, email_bcc, inlineattachments, appendattachments, imagefilenames)
                                 except Exception as e:
                                     logger.error(u'Failed to send the email. Exception: {}'.format(e))
                                     view_failure(view, u'VizAlerts was unable to process this view due to the following error: {}'.format(e))
 
                                 # reset variables for next email
                                 body = []
-                                attachments = []
+                                inlineattachments = []
                                 consolidate_email_ctr = 0
+                                appendattachments = []
                             else:
                                 # This isn't the end, and we're consolidating rows, so test to see if the next row needs
                                     # to be a new email
@@ -743,37 +751,21 @@ def process_csv(csvpath, view, sitename, viewname, subscriberemail, subscribersy
                                     logger.info(u'Sending email to {}, CC {}, BCC {}, Subject {}'.format(row[' Email To *'],
                                                                                             email_cc , email_bcc,
                                                                                             row[' Email Subject *']))
-                                    body.append(row[' Email Body *'])
 
-                                    # add the footer if needed
-                                    if has_email_footer:
-                                        body.append(row[' Email Footer ~'].replace(DEFAULT_FOOTER,
-                                                            bodyfooter.format(subscriberemail, vizurl, viewname)))
-                                    else:
-                                        # no footer specified, add the default footer
-                                        body.append(bodyfooter.format(subscriberemail, vizurl, viewname))
-
-                                    # Add the viz image if needed
-                                    replaceresult = replace_in_list(body, IMAGE_PLACEHOLDER,
-                                                                        u'<img src="cid:{}">'.format(basename(imagepath))
-                                                            )
-                                    if replaceresult['foundstring'] == True:
-                                        logger.debug(u'Found viz image string, adding attachments')
-                                        body = replaceresult['outlist']
-                                        if imagepath not in attachments:
-                                            attachments.append(imagepath)
-
+                                    body, inlineattachments, appendattachments = append_body_and_attachments(body, inlineattachments, appendattachments, row, imagepaths, subscriberemail, vizurl, viewname, has_email_footer, has_email_attachment)
+                                    
                                     # send the email
                                     try:
                                         send_email(email_from, row[' Email To *'], row[' Email Subject *'],
-                                                u''.join(body), email_cc, email_bcc, attachments)
+                                                u''.join(body), email_cc, email_bcc, inlineattachments, appendattachments, imagefilenames)
                                     except Exception as e:
                                         logger.error(u'Failed to send the email. Exception: {}'.format(e))
                                         view_failure(view, u'VizAlerts was unable to process this view due to the following error: {}'.format(e))
 
                                     body = []
                                     consolidate_email_ctr = 0
-                                    attachments = []
+                                    inlineattachments = []
+                                    appendattachments = []
                     else:
                         # emails are not being consolidated, so send the email
                         logger.info(u'Sending email to {}, CC {}, BCC {}, Subject {}'.format(row[' Email To *'],
@@ -786,35 +778,18 @@ def process_csv(csvpath, view, sitename, viewname, subscriberemail, subscribersy
                         if has_email_header:
                             body.append(row[' Email Header ~'])
 
-                        body.append(row[' Email Body *'])
-
-                        # add the footer if needed
-                        if has_email_footer:
-                            body.append(row[' Email Footer ~'].replace(DEFAULT_FOOTER,
-                                                            bodyfooter.format(subscriberemail, vizurl, viewname)))
-                        else:
-                            # no footer specified, add the default footer
-                            body.append(bodyfooter.format(subscriberemail, vizurl, viewname))
-
-                        # Add the viz image if needed
-                        replaceresult = replace_in_list(body, IMAGE_PLACEHOLDER,
-                                                            u'<img src="cid:{}">'.format(basename(imagepath))
-                                                )
-                        if replaceresult['foundstring'] == True:
-                            logger.debug(u'Found viz image string, adding attachments')
-                            body = replaceresult['outlist']
-                            if imagepath not in attachments:
-                                attachments.append(imagepath)
-
+                        body, inlineattachments, appendattachments = append_body_and_attachments(body, inlineattachments, appendattachments, row, imagepaths, subscriberemail, vizurl, viewname, has_email_footer, has_email_attachment)
+                                    
                         try:
                             send_email(email_from, row[' Email To *'], row[' Email Subject *'], u''.join(body), email_cc,
-                                    email_bcc, attachments)
+                                    email_bcc, inlineattachments, appendattachments, imagefilenames)
                         except Exception as e:
                             logger.error(u'Failed to send the email. Exception: {}'.format(e))
                             view_failure(view, u'VizAlerts was unable to process this view due to the following error: {}'.format(e))
 
-                        attachments = []
+                        inlineattachments = []
                         body = []
+                        appendattachments=[]
         else:
             # missing any valid action
             logger.info(u'No valid actions specified in view data for {}, skipping'.format(viewurlsuffix))
@@ -836,7 +811,7 @@ def get_mimetype(filename):
     return content_type.split("/", 1)
 
 
-def mimify_file(filename):
+def mimify_file(filename, inline = True, overridename = None):
     """Returns an appropriate MIME object for the given file.
 
     :param filename: A valid path to a file
@@ -847,12 +822,25 @@ def mimify_file(filename):
     """
 
     filename = abspath(expanduser(filename))
-    basefilename = basename(filename)
+    if overridename:
+        basefilename = overridename
+    else:
+        basefilename = basename(filename)
 
-    msg = MIMEBase(*get_mimetype(filename))
-    msg.set_payload(open(filename, "rb").read())
-    msg.add_header('Content-ID', '<{}>'.format(basefilename))
-    msg.add_header("Content-Disposition", "inline", filename=basefilename)
+    
+    if inline:
+        msg = MIMEBase(*get_mimetype(filename))
+        msg.set_payload(open(filename, "rb").read())
+        msg.add_header('Content-ID', '<{}>'.format(basefilename))
+        msg.add_header('Content-Disposition', 'inline; filename="%s"' % basefilename)
+    else:
+        msg = MIMEBase(*get_mimetype(filename))
+        #msg = MIMEBase('application', "octet-stream")
+        msg.set_payload( open(filename,"rb").read() )
+        if overridename:
+            basefilename = overridename
+           
+        msg.add_header('Content-Disposition', 'attachment; filename="%s"' % basefilename)
 
     encode_base64(msg)
 
@@ -1045,30 +1033,148 @@ def get_password_from_file(password):
         sys.exit(1)
 
 
-def find_vizimages_in_body(data, has_email_header, has_email_footer):
-    """Returns list of all found occurences of VIZ_IMAGE() in email body text"""
-    vizimagerefs = []
 
+def find_viz_refs(data, viewurlsuffix, has_email_header, has_email_footer, has_email_attachment):
+    """ Given the data this searches through the body, header, footer, and attachment for all references to vizzes to be downloaded, downloads only the distinct vizzes (to avoid duplicating downloads). 
+    
+    Returns vizcompleterefs dictionary that contains a key of each distinct viz reference. The value is another dictionary with the following keys:
+        vizref = the original viz reference string
+        view_url_suffix = the workbook/viewname to be downloaded, plus any URL parameters the user has added
+        formatstring = the format of the destinatino file, based on the VIZ_* reference
+        imagepath = the full path to the temp tile for the downloaded viz 
+        filename = the filename to use for appended attachments as well as exported files
+        exportfilepath = the path to use for an exported file (~~~not yet supported)
+        
+    """
+
+    vizcompleterefs = dict()        
+    vizrefs = []
+    imagepaths = dict()
+    vizdistinctrefs = dict()
+
+    # data is the CSV that has been downloaded for a given view
     for item in data:
-        # use regex once we start supporting arbitrary vizzes
-        result = re.search(u'VIZ[_]IMAGE()', item[' Email Body *'])
-        if result and result.group(0) not in vizimagerefs:
-            vizimagerefs.append(result.group(0))
+        # this might be able to be more efficient code
+        results = re.findall(u"VIZ[_]IMAGE\(.*?\)|VIZ[_]IMAGE\(\)", item[' Email Body *'])
+
         if has_email_header:
-            # Use regex once we start supporting arbitrary vizzes
-            headerresult = re.search('VIZ[_]IMAGE()', item[' Email Header ~'])
-            if headerresult and headerresult.group(0) not in vizimagerefs:
-                vizimagerefs.append(headerresult.group(0))
+            results.extend(re.findall(u"VIZ[_]IMAGE\(.*?\)|VIZ[_]IMAGE\(\)", item[' Email Header ~']))
+            
         if has_email_footer:
-            # Use regex once we start supporting arbitrary vizzes
-            footerresult = re.search('VIZ[_]IMAGE()', item[' Email Footer ~'])
-            if footerresult and footerresult.group(0) not in vizimagerefs:
-                vizimagerefs.append(footerresult.group(0))
+            results.extend(re.findall(u"VIZ[_]IMAGE\(.*?\)|VIZ[_]IMAGE\(\)", item[' Email Footer ~']))
+        
+        if has_email_attachment:
+            results.extend(re.findall(u"VIZ[_]IMAGE\(.*?\)|VIZ[_]IMAGE\(\)|VIZ[_]CSV\(.*?\)|VIZ[_]PDF\(.*?\)|VIZ[_]TWB\(.*?\)", item[' Email Attachment ~']))
 
-    return vizimagerefs
+    # loop through each found viz reference, i.e. everything in the VIZ_*(*).
+    for result in results
+        if result not in vizcompleterefs:
+            # create a dictionary to hold the necessary values for this viz reference
+            vizcompleterefs[result] = dict()
+            
+            # store the vizref itself as a value in the edict
+            vizcompleterefs[result]['vizref'] = result #
+            
+            # if the result is one of the placeholders then we will be pulling down the calling viz
+            if result in [IMAGE_PLACEHOLDER, PDF_PLACEHOLDER, CSV_PLACEHOLDER, TWB_PLACEHOLDER]:
+                vizcompleterefs[result]['view_url_suffix'] = viewurlsuffix
+            else:
+                # vizstring contains everything inside the VIZ_*() parentheses
+                vizstring = re.match(u'VIZ_.*?\((.*?)\)', vizref)
+                logger.debug('~vizstring',vizstring.group(1))
+                
+                # vizstring may contain reference to the viz plus advanced alert parameters like
+                # a filename or exportpathname.
+                
+                # if there is no delimiter then at this point we know the vizstring
+                # is just a viz to use
+                if ARGUMENT_DELIMITER not in vizstring.group(1):
+                    vizcompleterefs[result]['view_url_suffix'] = vizstring
 
+                # there are one or more arguments
+                else:
+                    # split vizstring into a list of arguments
+                    vizstringlist = vizstring.group(1).split(ARGUMENT_DELIMITER)
 
-def get_unique_vizdata(data, has_consolidate_email, has_email_from, has_email_cc, has_email_bcc, has_email_header, has_email_footer):
+                    # first argument could be empty, such as VIZ_IMAGE(|filename=someFileName)
+                    # in that case we'll use the calling viz
+                    if vizstringlist[0] == '':
+                        vizcompleterefs[result]['view_url_suffix'] = viewurlsuffix
+                    else:
+                        # return only the view
+                        vizcompleterefs[result]['view_url_suffix'] = vizstringlist[0]
+                    
+                    # if there is more than one element in the vizstring list then we
+                    # know there are arguments to parse out
+                    # this code could probably be simpler
+                    if len(vizstringlist) > 1:
+                        for element in vizstringlist[1:]:
+                        
+                            # looking for filenames
+                            if element.startswith(EXPORTFILENAME_ARGUMENT):
+                                filename = re.match(EXPORTFILENAME_ARGUMENT + u'=(.*)', element).group(1)
+                                # code from https://github.com/mitsuhiko/flask/blob/50dc2403526c5c5c67577767b05eb81e8fab0877/flask/helpers.py#L633
+                                # for validing filenames
+                                filename = posixpath.normpath(filename)
+                                for sep in _os_alt_seps:
+                                    if sep in filename:
+                                        errormessage = u'Alert was triggered, but found an invalid separator in filename: {}'.format(e.message)
+                                        logger.error(errormessage)
+                                        view_failure(view, errormessage)
+
+                                if os.path.isabs(filename) or filename.startswith('../') or filename.startswith('..\\'):
+                                    errormessage = u'Alert was triggered, but found an invalid filename: {}'.format(e.message)
+                                    logger.error(errormessage)
+                                    view_failure(view, errormessage)
+                                
+                                vizcompleterefs[result]['filename'] = filename
+
+                            # just getting the export filepath for now, will use it in a later update
+                            if element.startswith(EXPORTFILEPATH_ARGUMENT):
+                                exportfilepath = re.match(EXPORTFILEPATH_ARGUMENT + u'=(.*)', element).group(1)
+                                exportfilepath = posixpath.normpath(exportfilepath)
+                                
+                                if ospath.isabs(filename) or '../' in exportfilepath or '..\\' in exportfilepath:
+                                    errormessage = u'Alert was triggered, but found an invalid export file path: {}'.format(e.message)
+                                    logger.error(errormessage)
+                                    view_failure(view, errormessage)
+                                vizcompleterefs[result]['exportfilepath'] = exportfilepath
+            
+            # identifying the format for the output file
+            vizrefformat = re.match(u'VIZ_(.*?)\(', vizref)
+            if vizrefformat.group(1) == 'IMAGE':
+                vizcompleterefs[result]['formatstring'] = 'PNG'
+            else:
+                vizcompleterefs[result]['formatstring'] = vizrefformat.group(1)
+            
+            #creating distinct list of images to download
+            if vizcompleterefs[result]['view_url_suffix'] not in vizdistinctrefs:
+                vizdistinctrefs[vizcompleterefs[result]['view_url_suffix']] = dict()
+                vizdistinctrefs[vizcompleterefs[result]['view_url_suffix']]['imagepath'] = ''
+                vizdistinctrefs[vizcompleterefs[result]['view_url_suffix']]['formatstring'] = vizcompleterefs[result]['formatstring']
+        #end if result not in vizcompleterefs
+    #end for result in results
+
+    #loop over vizdistinctrefs to export files
+    for vizref in vizdistinctrefs:       
+        try:
+            view['view_url_suffix'] = vizref
+            # export the viz to a file, store path as value with vizref as key
+            vizdistinctrefs[vizref]['imagepath'] = tabhttp.export_view(configs, view, eval('tabhttp.Format.' + vizrefs[vizref]['formatstring']), logger)
+
+        except Exception as e:
+            errormessage = u'Alert was triggered, but encountered a failure rendering data/image: {}'.format(e.message)
+            logger.error(errormessage)
+            view_failure(view, errormessage)
+            raise e
+
+    #now match vizdistinctrefs to original references to store imagepaths
+    for result in vizcompleterefs:
+        vizcompleterefs[result]['imagepath'] = vizdistinctrefs[vizcompleterefs[result]['view_url_suffix']]['imagepath']
+
+    return vizcompleterefs
+
+def get_unique_vizdata(data, has_consolidate_email, has_email_from, has_email_cc, has_email_bcc, has_email_header, has_email_footer, has_email_attachment):
     """Returns a unique list of all relevant email fields in data. Also sorts data in proper order."""
 
     preplist = [] # list of dicts containing only keys of concern for de-duplication from data
@@ -1078,7 +1184,7 @@ def get_unique_vizdata(data, has_consolidate_email, has_email_from, has_email_cc
 
     # copy in only relevant fields
     for item in data:
-        newitem = {' Email Action *': item[' Email Action *'], ' Email To *': item[' Email To *'], ' Email Subject *': item[' Email Subject *'], ' Email Body *': item[' Email Body *']}
+        newitem = {' Email Action *': item[' Email Action *'], ' Email To *': item[' Email To *'], ' Email Subject *': item[' Email Subject *'], ' Email Body *': item[' Email Body *'], ' Email Attachment ~': item[' Email Attachment ~']}
         if has_consolidate_email:
             newitem[' Email Consolidate ~'] = item[' Email Consolidate ~']
         if has_email_from:
@@ -1091,6 +1197,8 @@ def get_unique_vizdata(data, has_consolidate_email, has_email_from, has_email_cc
             newitem[' Email Header ~'] = item[' Email Header ~']
         if has_email_footer:
             newitem[' Email Footer ~'] = item[' Email Footer ~']
+        if has_email_attachment:
+            newitem[' Email Attachment ~'] = item[' Email Attachment ~']
         preplist.append(newitem)
 
     logger.debug(u'Removing duplicates')
@@ -1182,17 +1290,47 @@ def get_footer(subscriberemail, subscribersysname, subscriberdomain, vizurl, vie
 
     return footer
 
+def append_body_and_attachments(body, inlineattachments, appendattachments, row, vizcompleterefs, subscriberemail, vizurl, viewname, has_email_footer, has_email_attachment):
+    """generic function for filling email body text with the body & footers from the csv plus inserting viz references"""
+    """for inline attachments"""
 
-def send_email(fromaddr, toaddrs, subject, content, ccaddrs=None, bccaddrs=None, attachments=None):
+    body.append(row[' Email Body *'])
+
+    # add the footer if needed
+    if has_email_footer:
+        body.append(row[' Email Footer ~'].replace(DEFAULT_FOOTER,
+                            bodyfooter.format(subscriberemail, vizurl, viewname)))
+    else:
+        # no footer specified, add the default footer
+        body.append(bodyfooter.format(subscriberemail, vizurl, viewname))
+
+    for vizresult in vizcompleterefs.iteritems():
+        
+        replaceresult = replace_in_list(body, vizresult,
+                                        u'<img src="cid:{}">'.format(basename(vizcompleterefs[vizresult]['imagepath']))
+                                )
+        if replaceresult['foundstring'] == True:
+            body = replaceresult['outlist']
+            if vizcompleterefs[vizresult] not in inlineattachments:
+                inlineattachments.append(vizcompleterefs[vizresult])
+ 
+        # testing each workbookview as to whether it may belong in an appended attachment
+        if has_email_attachment:
+            if row[' Email Attachment ~'].find(vizresult) >= 0 and vizresult not in appendattachments:
+                appendattachments.append(vizresult)
+
+    return body, inlineattachments, appendattachments
+    
+def send_email(fromaddr, toaddrs, subject, content, ccaddrs=None, bccaddrs=None, inlineattachments=None, appendattachments=None, imagefilenames=None):
     """Generic function to send an email"""
 
     try:
         logger.info(u'sending email: {},{},{},{},{},{},{}'.format(configs["smtp.serv"], fromaddr, toaddrs, ccaddrs, bccaddrs,
-                                                              subject, attachments))
+                                                              subject, inlineattachments, appendattachments))
         logger.debug(u'email body: {}'.format(content))
 
-        # Prepare Message
-        msg = MIMEMultipart('related')
+        # using mixed type because there can be inline and non-inline attachments
+        msg = MIMEMultipart('mixed')
         msg.set_charset('utf-8')
         msg.preamble = subject.encode('utf-8')
         msg['From'] = Header(fromaddr)
@@ -1213,16 +1351,32 @@ def send_email(fromaddr, toaddrs, subject, content, ccaddrs=None, bccaddrs=None,
             bccaddrs = re.split(EMAIL_RECIP_SPLIT_REGEX, bccaddrs.strip())
             # don't add to header, they are blind carbon-copied
             allrecips.extend(bccaddrs)
-        # Attach the main text
-        msgalternative = MIMEMultipart(u'alternative')
+
+        # Create a section for the body and inline attachments
+        msgalternative = MIMEMultipart(u'related')
         msg.attach(msgalternative)
         msgalternative.attach(MIMEText(content.encode('utf-8'), 'html', 'utf-8'))
 
-        # Attach any files
-        if attachments is not None:
-            for filename in attachments:
-                msg.attach(mimify_file(filename))
+        # Add inline attachments
+        if inlineattachments is not None:
+            for vizresult in inlineattachments:
+                msgalternative.attach(mimify_file(vizresult['imagepath'], inline = True)
 
+        
+        # Add appended attachments from Email Attachments field and prevent dup custom filenames
+        # appendedfilenames = []
+        if appendattachments is not None:
+            for vizresult in appendattachments:
+                if vizresult['filename'] is None:
+                    msg.attach(mimify_file(vizresult['imagepath'], inline = False))
+                else:
+                    if vizresult['filename'] not in appendedfilenames:
+                        appendedfilenames.append[vizresult['filename']]
+                        msg.attach(mimify_file(vizresult['imagepath'], inline = False, overridename = vizresult['filename']))
+                    else:
+                        msg.attach(mimify_file(vizresult['imagepath'], inline = False))
+
+                       
         server = smtplib.SMTP(configs["smtp.serv"])
         if configs["smtp.ssl"]:
             server.ehlo()
